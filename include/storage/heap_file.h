@@ -19,6 +19,8 @@ private:
     BufferPoolManager& bpm_;
     int first_directory_page_id_;
 
+    void UpdateDirectoryFreeSpace(int data_page_id, std::uint16_t free_space);
+
 public:
     explicit HeapFile(BufferPoolManager& bpm);
 

@@ -23,7 +23,10 @@ struct SlotEntry {
     }
 };
 
-constexpr std::size_t HEAP_PAGE_SIZE = PAGE_SIZE - sizeof(HeapPageHeader) - sizeof(SlotEntry);
+static_assert(sizeof(HeapPageHeader) == 6, "Unexpected HeapPageHeader layout");
+static_assert(sizeof(SlotEntry) == 4, "Unexpected SlotEntry layout");
+
+constexpr std::size_t MAX_RECORD_SIZE = PAGE_SIZE - sizeof(HeapPageHeader) - sizeof(SlotEntry);
 
 class HeapPage {
 private:

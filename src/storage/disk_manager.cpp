@@ -2,7 +2,6 @@
 #include "storage/page.h"
 
 #include <array>
-#include <cstring>
 #include <stdexcept>
 
 bool DiskManager::IsValidPageId(int page_id) const {
@@ -67,6 +66,10 @@ int DiskManager::AllocatePage() {
   }
 
   file_.flush();
+
+  if (!file_) {
+    throw std::runtime_error("Failed to flush page");
+  }
 
   return page_id;
 }

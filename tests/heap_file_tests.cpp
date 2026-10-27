@@ -3,6 +3,7 @@
 #include "storage/heap_file.h"
 #include "buffer/buffer_pool_manager.h"
 #include "storage/page.h"
+#include "storage/page_directory.h"
 
 /*
 1. InsertAndGetSingleRecord
@@ -11,73 +12,148 @@
    - verify returned RID
    - call GetRecord
    - verify bytes match
+
 2. InsertMultipleRecordsSamePage
    - insert several small records
    - verify they all land on the same page_id
    - verify different slot_ids
    - read all records back
+
 3. InsertSpillsAcrossMultiplePages
    - insert records until one page fills
    - keep inserting
    - verify a later record gets a different page_id
    - verify records from both pages are readable
+
 4. GetRecordSurvivesEvictionAndReload
    - insert records
    - use a very small buffer pool
    - force their pages out by touching other pages
    - call GetRecord again
    - verify data reloads correctly from disk
+
 5. DeleteRecord
    - insert a record
    - delete via RID
    - verify DeleteRecord returns true
    - GetRecord(rid) returns nullopt
+
 6. DeleteInvalidRID
    - invalid page_id
    - valid page but invalid slot_id
    - already-deleted RID
    - all should return false
+
 7. UpdateRecordSameSize
    - insert record
    - update with same-size data
    - RID stays the same
    - GetRecord returns new bytes
+
 8. UpdateRecordSmaller
    - insert larger record
    - update with smaller one
    - verify success and new data
+
 9. UpdateRecordLargerWhenSpaceExists
    - insert record
    - update to larger record while page still has room
    - verify success and same RID
+
 10. UpdateRecordFailsWhenPageLacksSpace
     - fill the page enough that growing one record cannot fit
     - update should return false
     - original record must remain unchanged
+
 11. UpdateInvalidRID
     - nonexistent page
     - nonexistent slot
     - deleted slot
     - update should return false
+
 12. OversizedRecordFails
     - construct a record larger than any HeapPage can store
     - InsertRecord returns nullopt
-    - later, once we fix allocation semantics, also verify no unreachable disk page was allocated
+    - verify impossible records are rejected before normal insertion
+
 13. ReturnedRecordOwnsItsData
     - insert record
     - call HeapFile::GetRecord
     - force eviction / overwrite frames
     - verify the returned OwnedRecord still contains the original data
-    - this specifically proves the span-to-vector copy boundary is correct
+    - proves the span-to-vector copy boundary is correct
+
 14. DeletedSlotCanBeReused
     - insert A, B, C
     - delete B
     - insert D
-    - verify insertion still works and ideally that slot reuse happens as expected through HeapPage
+    - verify insertion still works
+    - verify the deleted slot can be reused
+
 15. RecordsRemainIndependentAcrossPages
     - deliberately create at least two heap pages
     - modify/delete/update records on one page
     - verify records on the other page are untouched
+
+16. ReopenHeapFilePreservesRecords
+    - create HeapFile and insert a record
+    - save the first directory page ID and RID
+    - flush dirty pages to disk
+    - destroy the original BufferPoolManager
+    - reopen the same database file with a new BufferPoolManager
+    - reopen HeapFile using the saved directory page ID
+    - verify the old RID still retrieves the original record
+
+17. InsertCreatesDirectoryEntryWithCorrectFreeSpace
+    - insert the first record into a new HeapFile
+    - verify the directory contains exactly one entry
+    - verify the entry page_id matches the inserted record's page
+    - verify cached directory free_space matches HeapPage::GetFreeSpace()
+
+18. MultipleInsertsSamePageUpdateDirectoryFreeSpace
+    - insert a record and record the directory free_space
+    - insert another record that fits on the same data page
+    - verify both records use the same page_id
+    - verify the directory still contains only one entry
+    - verify cached free_space decreases
+    - verify cached free_space still matches the actual HeapPage
+
+19. SpillToSecondPageAddsSecondDirectoryEntry
+    - insert records large enough to force creation of a second data page
+    - verify the records span different page_ids
+    - verify the directory entry count increases to two
+    - verify the directory contains entries for both data pages
+
+20. DeleteRecordUpdatesDirectoryFreeSpace
+    - insert a record
+    - record the directory's cached free_space
+    - delete the record
+    - verify directory free_space increases
+    - verify cached free_space matches the actual HeapPage after deletion
+
+21. UpdateRecordLargerDecreasesDirectoryFreeSpace
+    - insert a smaller record
+    - record the directory's cached free_space
+    - update the record to a larger value
+    - verify the update succeeds
+    - verify directory free_space decreases
+    - verify cached free_space matches the actual HeapPage
+
+22. UpdateRecordSmallerIncreasesDirectoryFreeSpace
+    - insert a larger record
+    - record the directory's cached free_space
+    - update the record to a smaller value
+    - verify the update succeeds
+    - verify directory free_space increases
+    - verify cached free_space matches the actual HeapPage
+
+23. FailedUpdateDoesNotChangeDirectoryFreeSpace
+    - arrange a page so a record cannot grow enough to satisfy an update
+    - record the directory's cached free_space before the update
+    - attempt the oversized update
+    - verify UpdateRecord returns false
+    - verify directory free_space remains unchanged
+    - proves failed operations do not corrupt cached directory metadata
 */
 
 class HeapFileTest : public ::testing::Test {
@@ -95,6 +171,64 @@ protected:
             2,
             db_path
         );
+    }
+
+    PageDirectoryEntry ReadDirectoryEntry(HeapFile& heap_file, std::uint16_t index) {
+        int directory_page_id = heap_file.GetFirstDirectoryPageId();
+
+        Page* dir_page = bpm->FetchPage(directory_page_id);
+        if (dir_page == nullptr) {
+            throw std::runtime_error("Failed to fetch directory page in test");
+        }
+
+        PageDirectoryEntry entry{};
+
+        {
+            auto guard = dir_page->ReadLatch();
+            PageDirectory directory(*dir_page);
+            entry = directory.ReadEntry(index);
+        }
+
+        bpm->UnpinPage(directory_page_id, false);
+        return entry;
+    }
+
+    DirectoryPageHeader ReadDirectoryHeader(HeapFile& heap_file) {
+        int directory_page_id = heap_file.GetFirstDirectoryPageId();
+
+        Page* dir_page = bpm->FetchPage(directory_page_id);
+        if (dir_page == nullptr) {
+            throw std::runtime_error("Failed to fetch directory page in test");
+        }
+
+        DirectoryPageHeader header{};
+
+        {
+            auto guard = dir_page->ReadLatch();
+            PageDirectory directory(*dir_page);
+            header = directory.ReadHeader();
+        }
+
+        bpm->UnpinPage(directory_page_id, false);
+        return header;
+    }
+
+    std::uint16_t ReadHeapPageFreeSpace(int page_id) {
+        Page* page = bpm->FetchPage(page_id);
+        if (page == nullptr) {
+            throw std::runtime_error("Failed to fetch heap page in test");
+        }
+
+        std::uint16_t free_space = 0;
+
+        {
+            auto guard = page->ReadLatch();
+            HeapPage heap_page(*page);
+            free_space = heap_page.GetFreeSpace();
+        }
+
+        bpm->UnpinPage(page_id, false);
+        return free_space;
     }
 
     void TearDown() override {
@@ -764,3 +898,159 @@ TEST_F(HeapFileTest, ReopenHeapFilePreservesRecords) {
         )
     );
 }
+
+TEST_F(HeapFileTest, InsertCreatesDirectoryEntryWithCorrectFreeSpace) {
+    HeapFile heap_file(*bpm);
+
+    std::array<std::byte, 100> data{};
+    data.fill(std::byte{'A'});
+
+    auto rid = heap_file.InsertRecord(data);
+    ASSERT_TRUE(rid.has_value());
+
+    auto header = ReadDirectoryHeader(heap_file);
+    ASSERT_EQ(header.num_entries, 1);
+
+    auto entry = ReadDirectoryEntry(heap_file, 0);
+    EXPECT_EQ(entry.page_id, rid->page_id);
+
+    auto actual_free_space = ReadHeapPageFreeSpace(rid->page_id);
+    EXPECT_EQ(entry.free_space, actual_free_space);
+}
+
+TEST_F(HeapFileTest, MultipleInsertsSamePageUpdateDirectoryFreeSpace) {
+    HeapFile heap_file(*bpm);
+
+    std::array<std::byte, 100> first{};
+    std::array<std::byte, 100> second{};
+    first.fill(std::byte{'A'});
+    second.fill(std::byte{'B'});
+
+    auto rid1 = heap_file.InsertRecord(first);
+    ASSERT_TRUE(rid1.has_value());
+
+    auto before = ReadDirectoryEntry(heap_file, 0);
+
+    auto rid2 = heap_file.InsertRecord(second);
+    ASSERT_TRUE(rid2.has_value());
+    ASSERT_EQ(rid1->page_id, rid2->page_id);
+
+    auto header = ReadDirectoryHeader(heap_file);
+    EXPECT_EQ(header.num_entries, 1);
+
+    auto after = ReadDirectoryEntry(heap_file, 0);
+    EXPECT_LT(after.free_space, before.free_space);
+    EXPECT_EQ(after.free_space, ReadHeapPageFreeSpace(rid1->page_id));
+}
+
+TEST_F(HeapFileTest, SpillToSecondPageAddsSecondDirectoryEntry) {
+    HeapFile heap_file(*bpm);
+
+    std::array<std::byte, 2500> first{};
+    std::array<std::byte, 2500> second{};
+    first.fill(std::byte{'A'});
+    second.fill(std::byte{'B'});
+
+    auto rid1 = heap_file.InsertRecord(first);
+    auto rid2 = heap_file.InsertRecord(second);
+
+    ASSERT_TRUE(rid1.has_value());
+    ASSERT_TRUE(rid2.has_value());
+    ASSERT_NE(rid1->page_id, rid2->page_id);
+
+    auto header = ReadDirectoryHeader(heap_file);
+    ASSERT_EQ(header.num_entries, 2);
+
+    auto entry0 = ReadDirectoryEntry(heap_file, 0);
+    auto entry1 = ReadDirectoryEntry(heap_file, 1);
+
+    EXPECT_EQ(entry0.page_id, rid1->page_id);
+    EXPECT_EQ(entry1.page_id, rid2->page_id);
+    EXPECT_EQ(entry0.free_space, ReadHeapPageFreeSpace(rid1->page_id));
+    EXPECT_EQ(entry1.free_space, ReadHeapPageFreeSpace(rid2->page_id));
+}
+
+TEST_F(HeapFileTest, DeleteRecordUpdatesDirectoryFreeSpace) {
+    HeapFile heap_file(*bpm);
+
+    std::array<std::byte, 500> data{};
+    data.fill(std::byte{'A'});
+
+    auto rid = heap_file.InsertRecord(data);
+    ASSERT_TRUE(rid.has_value());
+
+    auto before = ReadDirectoryEntry(heap_file, 0);
+
+    ASSERT_TRUE(heap_file.DeleteRecord(*rid));
+
+    auto after = ReadDirectoryEntry(heap_file, 0);
+    EXPECT_GT(after.free_space, before.free_space);
+    EXPECT_EQ(after.free_space, ReadHeapPageFreeSpace(rid->page_id));
+}
+
+TEST_F(HeapFileTest, UpdateRecordLargerDecreasesDirectoryFreeSpace) {
+    HeapFile heap_file(*bpm);
+
+    std::array<std::byte, 100> original{};
+    std::array<std::byte, 500> updated{};
+    original.fill(std::byte{'A'});
+    updated.fill(std::byte{'B'});
+
+    auto rid = heap_file.InsertRecord(original);
+    ASSERT_TRUE(rid.has_value());
+
+    auto before = ReadDirectoryEntry(heap_file, 0);
+
+    ASSERT_TRUE(heap_file.UpdateRecord(*rid, updated));
+
+    auto after = ReadDirectoryEntry(heap_file, 0);
+    EXPECT_LT(after.free_space, before.free_space);
+    EXPECT_EQ(after.free_space, ReadHeapPageFreeSpace(rid->page_id));
+}
+
+TEST_F(HeapFileTest, UpdateRecordSmallerIncreasesDirectoryFreeSpace) {
+    HeapFile heap_file(*bpm);
+
+    std::array<std::byte, 500> original{};
+    std::array<std::byte, 100> updated{};
+    original.fill(std::byte{'A'});
+    updated.fill(std::byte{'B'});
+
+    auto rid = heap_file.InsertRecord(original);
+    ASSERT_TRUE(rid.has_value());
+
+    auto before = ReadDirectoryEntry(heap_file, 0);
+
+    ASSERT_TRUE(heap_file.UpdateRecord(*rid, updated));
+
+    auto after = ReadDirectoryEntry(heap_file, 0);
+    EXPECT_GT(after.free_space, before.free_space);
+    EXPECT_EQ(after.free_space, ReadHeapPageFreeSpace(rid->page_id));
+}
+
+TEST_F(HeapFileTest, FailedUpdateDoesNotChangeDirectoryFreeSpace) {
+    HeapFile heap_file(*bpm);
+
+    std::array<std::byte, 500> original{};
+    std::array<std::byte, 3000> filler{};
+    std::array<std::byte, 2000> too_large{};
+    original.fill(std::byte{'A'});
+    filler.fill(std::byte{'B'});
+    too_large.fill(std::byte{'C'});
+
+    auto rid = heap_file.InsertRecord(original);
+    auto filler_rid = heap_file.InsertRecord(filler);
+
+    ASSERT_TRUE(rid.has_value());
+    ASSERT_TRUE(filler_rid.has_value());
+    ASSERT_EQ(rid->page_id, filler_rid->page_id);
+
+    auto before = ReadDirectoryEntry(heap_file, 0);
+
+    EXPECT_FALSE(heap_file.UpdateRecord(*rid, too_large));
+
+    auto after = ReadDirectoryEntry(heap_file, 0);
+    EXPECT_EQ(after.free_space, before.free_space);
+    EXPECT_EQ(after.free_space, ReadHeapPageFreeSpace(rid->page_id));
+}
+

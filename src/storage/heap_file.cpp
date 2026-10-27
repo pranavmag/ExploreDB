@@ -35,12 +35,64 @@ int HeapFile::GetFirstDirectoryPageId() const {
     return first_directory_page_id_;
 }
 
+void HeapFile::UpdateDirectoryFreeSpace(int data_page_id, std::uint16_t free_space) {
+    int directory_page_id = first_directory_page_id_;
+
+    while (directory_page_id != -1) {
+        Page* dir_page = bpm_.FetchPage(directory_page_id);
+
+        if (dir_page == nullptr) {
+            throw std::runtime_error(
+                "Failed to fetch HeapFile directory page"
+            );
+        }
+
+        bool found = false;
+        DirectoryPageHeader header{};
+
+        {
+            auto guard = dir_page->WriteLatch();
+
+            PageDirectory directory(*dir_page);
+
+            header = directory.ReadHeader();
+
+            for (std::uint16_t i = 0;
+                 i < header.num_entries;
+                 ++i) {
+
+                auto entry = directory.ReadEntry(i);
+
+                if (entry.page_id == data_page_id) {
+                    entry.free_space = free_space;
+                    directory.WriteEntry(i, entry);
+
+                    found = true;
+                    break;
+                }
+            }
+        }
+
+        bpm_.UnpinPage(directory_page_id, found);
+
+        if (found) {
+            return;
+        }
+
+        directory_page_id = header.next_dir_page;
+    }
+
+    throw std::runtime_error(
+        "HeapFile directory missing entry for data page"
+    );
+}
+
 std::optional<RID> HeapFile::InsertRecord(const Record& record) {
     if (record.empty()) {
         return std::nullopt;
     }
 
-    if (record.size() > HEAP_PAGE_SIZE) {
+    if (record.size() > MAX_RECORD_SIZE) {
         return std::nullopt;
     }
 
@@ -266,14 +318,15 @@ std::optional<OwnedRecord> HeapFile::GetRecord(const RID &rid) {
 bool HeapFile::DeleteRecord(const RID &rid) {
     int page_id = rid.page_id;
     std::uint16_t slot_id = rid.slot_id;
-
-    Page* page = bpm_.FetchPage(page_id);
+    
+    Page *page = bpm_.FetchPage(page_id);
 
     if (page == nullptr) {
         return false;
     }
 
     bool is_deleted = false;
+    std::uint16_t remaining_free_space = 0;
 
     {
         auto guard = page->WriteLatch();
@@ -281,11 +334,21 @@ bool HeapFile::DeleteRecord(const RID &rid) {
         HeapPage heap_page(*page);
 
         is_deleted = heap_page.DeleteRecord(slot_id);
+
+        if (is_deleted) {
+            remaining_free_space = heap_page.GetFreeSpace();
+        }
     }
 
     bpm_.UnpinPage(page_id, is_deleted);
 
-    return is_deleted;
+    if (!is_deleted) {  
+        return false;
+    }
+
+    UpdateDirectoryFreeSpace(page_id, remaining_free_space);
+
+    return true;
 }
 
 bool HeapFile::UpdateRecord(const RID &rid, const Record &rec) {
@@ -299,6 +362,7 @@ bool HeapFile::UpdateRecord(const RID &rid, const Record &rec) {
     }
 
     bool is_updated = false;
+    std::uint16_t remaining_free_space = 0;
 
     {
         auto guard = page->WriteLatch();
@@ -306,9 +370,19 @@ bool HeapFile::UpdateRecord(const RID &rid, const Record &rec) {
         HeapPage heap_page(*page);
 
         is_updated = heap_page.UpdateRecord(slot_id, rec);
+
+        if (is_updated) {
+            remaining_free_space = heap_page.GetFreeSpace();
+        }
     }
 
     bpm_.UnpinPage(page_id, is_updated);
 
-    return is_updated;
+    if (!is_updated) {
+        return false;
+    }
+
+    UpdateDirectoryFreeSpace(page_id, remaining_free_space);
+
+    return true;
 }

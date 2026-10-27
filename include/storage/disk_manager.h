@@ -14,7 +14,7 @@ private:
     fs::path file_path_;
     std::fstream file_;
     std::mutex disk_mutex_;
-
+ 
 public:
     explicit DiskManager(const fs::path& file_path);
 
