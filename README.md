@@ -1,143 +1,408 @@
-# Buffer Pool Manager
+# ExploreDB
 
-A small C++ implementation of a database buffer pool manager, built from scratch as a learning project focused on understanding **database internals, concurrency, and systems programming**.
+**ExploreDB** is an educational and experimental relational database engine written in modern C++.
 
-## Overview
+The project is built from scratch to explore how database systems work internally: page storage, buffer management, record layout, indexing, query execution, and eventually transactions and recovery.
 
-Databases don't normally read and write every page directly from disk whenever data is accessed. Instead, they maintain a region of memory called a **buffer pool** that caches frequently accessed database pages.
+Rather than aiming to compete with production systems such as PostgreSQL or DuckDB, ExploreDB is intended to become a platform for **implementing, comparing, and benchmarking database algorithms under controlled workloads**.
 
-This project implements a simplified version of that system.
+A major long-term goal is to make important internal policies interchangeable and observable. For example, the same workload could be executed using CLOCK, LRU, or LRU-K replacement and analyzed using Python to understand where each policy succeeds or fails.
 
-The `BufferPoolManager` is responsible for moving pages between the simulated disk and memory, tracking which pages are currently cached, managing page pinning and dirty state, synchronizing concurrent access, and choosing pages to evict when the buffer pool is full.
+---
 
-The simulated disk is represented by an in-memory byte array, allowing the project to focus on buffer management without depending on an actual filesystem or database storage engine.
+## Project Goals
 
-## Architecture
+ExploreDB has three primary goals:
 
-At a high level:
+1. **Build database internals from first principles**
+   - Implement the storage, buffer, indexing, and execution layers directly in C++.
+   - Understand the invariants and tradeoffs behind each subsystem.
+
+2. **Make database algorithms observable and experimental**
+   - Support alternative implementations of important algorithms.
+   - Expose metrics such as cache hits, misses, evictions, disk I/O, latency, and throughput.
+   - Compare behavior across controlled workloads.
+
+3. **Serve as a long-term systems programming project**
+   - Practice large-scale C++ architecture, concurrency, testing, persistence, and performance analysis.
+   - Favor clear component boundaries and documented design decisions over rapidly accumulating features.
+
+---
+
+## Current Architecture
+
+The engine currently implements the storage and buffer-management foundations.
 
 ```text
-                    BufferPoolManager
-                           |
-          +----------------+----------------+
-          |                |                |
-          v                v                v
-      PageTable       ClockReplacer     DiskManager
-          |                |                |
-          v                v                v
-   page_id -> frame   selects victim    simulated disk
-                           |
-                           v
-                         Frame
-                           |
-                           v
-                         Page
-                           |
-                           v
-                  reader/writer latch
+HeapFile
+    │
+    ├── record-level CRUD
+    ├── persistent page ownership
+    ├── page selection
+    └── free-space metadata maintenance
+    │
+    ├───────────────┐
+    ▼               ▼
+PageDirectory     HeapPage
+    │               │
+    └───────┬───────┘
+            ▼
+           Page
+            │
+            ▼
+    BufferPoolManager
+            │
+      ┌─────┴─────┐
+      ▼           ▼
+ PageTable    ClockReplacer
+                    │
+                    ▼
+                  Frame
+            │
+            ▼
+       DiskManager
+            │
+            ▼
+      Database File
 ```
 
-### Main Concepts
+### Storage
 
-* **Page** — A fixed-size unit of database data (4096 bytes). Pages also contain a reader-writer latch for coordinating concurrent access to page contents.
+**DiskManager**
+- File-backed persistent page storage
+- Fixed-size 4096-byte pages
+- Page allocation
+- Full-page reads and writes
+- Serialized file I/O
 
-* **Frame** — A stable slot in the buffer pool containing a page and metadata such as its pin count and dirty state.
+**HeapPage**
+- Slotted-page layout for variable-length records
+- Stable slot IDs
+- Record insertion, lookup, deletion, and update
+- Deleted-slot reuse
+- Page compaction
+- Free-space tracking
 
-* **Page Table** — Maps logical page IDs to the frames currently containing them.
+**PageDirectory**
+- Persistent metadata describing HeapFile data pages
+- Cached free-space information
+- Linked directory pages for scalable HeapFile growth
 
-* **CLOCK Replacer** — Chooses an unpinned frame to evict when the buffer pool is full.
+**HeapFile**
+- Persistent collection of HeapPages
+- Record-level CRUD through RIDs
+- Data-page selection during insertion
+- Persistent page ownership
+- Directory free-space synchronization
+- Directory-page chaining
+- Reopening existing heap files from persistent metadata
 
-* **Disk Manager** — Simulates persistent storage and handles reading and writing pages.
+Records are identified using:
 
-* **Buffer Pool Manager** — Coordinates page fetching, pinning, unpinning, eviction, flushing, and synchronization of shared buffer-pool metadata.
+```cpp
+struct RID {
+    int page_id;
+    std::uint16_t slot_id;
+};
+```
+
+---
+
+## Buffer Pool
+
+The `BufferPoolManager` sits between higher-level storage components and physical disk I/O.
+
+It currently supports:
+
+- Page fetching
+- Page allocation
+- Pinning and unpinning
+- Dirty-page tracking
+- Explicit page flushing
+- Flushing all resident dirty pages
+- CLOCK-based replacement
+- Dirty-page write-back during eviction
+- Stable frame ownership
+- Concurrent page access
+- Reader/writer page latching
+- Concurrent eviction and reload
+
+The buffer pool uses a page table to map:
+
+```text
+page_id -> frame_id
+```
+
+and currently uses the CLOCK replacement algorithm when no empty frame is available.
+
+---
 
 ## Concurrency Model
 
-The current implementation supports concurrent access using two levels of synchronization.
+ExploreDB currently uses two levels of synchronization.
 
-The `BufferPoolManager` uses a coarse-grained mutex to protect shared metadata such as the page table, frame state, pin counts, dirty flags, frame reassignment, and CLOCK replacement state.
+The `BufferPoolManager` uses a mutex to protect shared buffer-pool metadata such as:
 
-Each `Page` also owns a `std::shared_mutex`, allowing:
+- page-table mappings
+- frame assignment
+- pin counts
+- dirty state
+- replacement-policy state
 
-* Multiple concurrent readers
-* A single exclusive writer
-* Readers and writers to synchronize access to page contents independently of buffer-pool metadata
+Each `Page` owns a `std::shared_mutex`, allowing:
 
-Page latches use RAII through `std::shared_lock` and `std::unique_lock`.
+- multiple concurrent readers
+- one exclusive writer
+
+Page latches are managed with RAII using `std::shared_lock` and `std::unique_lock`.
 
 The current lock-ordering rule is:
 
 ```text
-BufferPoolManager mutex
+BufferPoolManager coordination
         ↓
 Page latch
 ```
 
-Callers release page latches before calling operations such as `UnpinPage()`.
+Higher-level storage components are responsible for pinning pages through the buffer pool and acquiring the appropriate page latch before accessing page contents.
 
-## Why I Built This
+---
 
-This project is primarily a **learning exercise**.
+## Persistent Storage
 
-The goal is to go beyond learning database concepts theoretically and actually implement some of the mechanisms that real database systems rely on.
+ExploreDB uses a real file-backed storage layer.
 
-The project is intentionally being built incrementally, with correctness and understanding taking priority over immediately building a production-quality database component.
+The database file is treated as a sequence of fixed-size pages:
 
-## Current Status
+```text
+page 0: bytes [0, 4095]
+page 1: bytes [4096, 8191]
+page 2: bytes [8192, 12287]
+...
+```
 
-**Buffer Pool Manager v2 — Complete**
+Page IDs currently map directly to physical page offsets:
 
-The current implementation supports:
+```text
+offset = page_id * PAGE_SIZE
+```
 
-* Page fetching
-* Page insertion into the buffer pool
-* Page pinning and unpinning
-* Dirty-page tracking
-* CLOCK-based eviction
-* CLOCK reference-bit updates
-* Dirty-page write-back during eviction
-* Explicit page flushing
-* Flushing all resident dirty pages
-* Simulated disk storage
-* Stable frame ownership
-* Concurrent buffer-pool access
-* Reader-writer page latching
-* Thread-safe pin count and dirty-state transitions
-* Concurrent eviction
-* Concurrent dirty-page eviction and reload
+Pages are cached in memory by the buffer pool and written back when explicitly flushed or when dirty pages are evicted.
 
-Testing currently includes:
+The engine does not yet provide crash recovery or full transactional durability.
 
-* Single-threaded integration tests
-* Concurrent fetch tests
-* Concurrent write tests
-* Concurrent eviction tests
-* Concurrent dirty-eviction tests
-* Randomized multi-threaded stress tests
-* ThreadSanitizer runs for detecting data races
+---
 
-## Planning
+## Testing
 
-Visit my Obsidian Github repo if you are interested in looking through my notes and planning for this project: https://github.com/pranavmag/Obsidian/tree/main/Database%20Systems/Projects/Buffer%20Pool
+The project uses GoogleTest and includes unit, integration, persistence, and concurrency testing.
 
-## Future Work
+Current coverage includes:
 
-Planned improvements include:
+- DiskManager page allocation and persistence
+- Invalid and misaligned file handling
+- HeapPage record insertion, deletion, update, and compaction
+- Slot reuse
+- HeapFile CRUD
+- Record persistence across buffer-pool recreation
+- Page-directory metadata synchronization
+- Directory-page growth and chaining
+- Buffer-pool eviction
+- Dirty-page write-back
+- Concurrent fetches and writes
+- Concurrent eviction
+- Randomized multi-threaded stress testing
+- ThreadSanitizer testing for data races
 
-* More complete page creation/deletion semantics
-* Improved error handling
-* Page guard abstractions for safer pin/latch lifetime management
-* Finer-grained locking if performance becomes a concern
-* More adversarial and randomized concurrency testing
-* Heap-file and page-layout implementation
-* Hash indexes and B+ trees
-* External sorting
-* Join algorithms
-* Query execution operators
-* Basic query optimization
+Correctness tests intentionally exercise very small buffer pools to force eviction and expose pinning or lifetime errors.
 
-## Project Goal
+---
 
-The long-term goal is to use this project as a foundation for exploring more of the internals behind database systems and to develop stronger **C++ systems programming skills through implementation rather than purely theoretical study**.
+## Building
 
-The buffer pool is intended to serve as the storage foundation for future components such as heap files, indexes, external sorting, joins, execution operators, and query optimization.
+ExploreDB uses CMake.
+
+```bash
+cmake -S . -B build
+cmake --build build
+```
+
+To build the test suite:
+
+```bash
+cmake --build build --target db_tests
+```
+
+Run all tests:
+
+```bash
+./build/db_tests
+```
+
+Run a specific GoogleTest suite:
+
+```bash
+./build/db_tests --gtest_filter=HeapFileTest.*
+```
+
+---
+
+## Documentation
+
+Design documentation lives under [`docs/`](docs/).
+
+The documentation is split between the high-level system architecture and detailed component designs.
+
+```text
+docs/
+├── Architecture.md
+├── Technical_Debt.md
+├── buffer/
+└── storage/
+```
+
+[`docs/Architecture.md`](docs/Architecture.md) describes the overall system structure and component boundaries.
+
+[`docs/Technical_Debt.md`](docs/Technical_Debt.md) tracks known limitations, unresolved design questions, and future architectural work.
+
+Individual component documents describe their responsibilities, invariants, concurrency assumptions, and current limitations.
+
+---
+
+## Experimental Direction
+
+ExploreDB is intended to evolve beyond implementing one fixed version of each database algorithm.
+
+Where useful, major policies will become interchangeable so they can be evaluated under the same workloads.
+
+### Buffer Replacement
+
+The current implementation uses CLOCK.
+
+Planned experiments include:
+
+- CLOCK
+- LRU
+- LRU-K
+- ARC
+- potentially additional replacement policies
+
+Example workloads may include:
+
+- uniform random accesses
+- hot/cold skew
+- sequential scans
+- mixed sequential and frequently reused pages
+- varying working-set sizes
+- varying buffer-pool capacities
+
+Metrics may include:
+
+- cache hit and miss rates
+- eviction counts
+- disk reads and writes
+- dirty-page flushes
+- latency
+- throughput
+- replacement-policy CPU overhead
+- metadata memory overhead
+
+The goal is not simply to determine which algorithm is "best," but to understand **which workloads favor each algorithm and why**.
+
+---
+
+## Python Benchmarking
+
+Benchmarking is intended to become a first-class part of ExploreDB.
+
+C++ will implement and execute the database algorithms, while Python will be used for benchmark orchestration, analysis, and visualization.
+
+The expected workflow is:
+
+```text
+C++ database engine
+        ↓
+benchmark / workload runner
+        ↓
+structured metrics
+        ↓
+Python
+        ↓
+pandas / NumPy / Matplotlib
+        ↓
+analysis and visualization
+```
+
+Future experiments will extend beyond buffer replacement into areas such as:
+
+- external sorting
+- replacement selection
+- join algorithms
+- indexing strategies
+- storage-management policies
+- query execution techniques
+
+---
+
+## Roadmap
+
+The current focus is the storage engine and experimental infrastructure.
+
+Planned areas include:
+
+- [x] File-backed DiskManager
+- [x] BufferPoolManager
+- [x] CLOCK replacement
+- [x] Concurrent page access and latching
+- [x] Slotted HeapPages
+- [x] Persistent HeapFiles
+- [x] PageDirectory and free-space metadata
+- [x] Directory-page chaining
+- [ ] Benchmark instrumentation
+- [ ] Python benchmark and visualization pipeline
+- [ ] Pluggable replacement-policy interface
+- [ ] LRU replacement
+- [ ] LRU-K replacement
+- [ ] Additional replacement-policy experiments
+- [ ] B+ tree indexing
+- [ ] External sorting
+- [ ] Relational execution operators
+- [ ] Join algorithms
+- [ ] SQL parsing and semantic analysis
+- [ ] Query planning and optimization
+- [ ] Transactions and concurrency control
+- [ ] Write-ahead logging and recovery
+
+The roadmap is intentionally iterative. New abstractions are introduced when concrete implementations demonstrate a useful shared boundary rather than being designed prematurely.
+
+---
+
+## Long-Term Vision
+
+ExploreDB is intended to become an **interactive database-internals laboratory**.
+
+A future interface may allow users to configure engine behavior before executing workloads, for example:
+
+```sql
+SET eviction_policy = 'lru_k';
+SET buffer_pool_size = 128;
+```
+
+The same workload could then be executed under different configurations and compared using internal engine metrics and Python-generated analysis.
+
+This could make ExploreDB useful for:
+
+- learning database internals
+- university database-systems courses
+- experimenting with database algorithms
+- visualizing systems tradeoffs
+- benchmarking alternative implementations
+- practicing systems programming and database engineering
+
+The project prioritizes understanding, observability, and experimentation over production deployment.
+
+---
+
+## License
+
+ExploreDB is licensed under the [MIT License](LICENSE).
