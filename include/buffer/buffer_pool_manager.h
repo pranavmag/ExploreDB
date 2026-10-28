@@ -5,9 +5,20 @@
 #include "buffer/frame.h"
 #include "buffer/page_table.h"
 
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <vector>
+
+struct BufferPoolStats {
+    std::uint64_t fetch_requests{0};
+    std::uint64_t hits{0};
+    std::uint64_t misses{0};
+    std::uint64_t evictions{0};
+    std::uint64_t disk_reads{0};
+    std::uint64_t disk_writes{0};
+    std::uint64_t dirty_evictions{0};
+};
 
 class BufferPoolManager {
 private:
@@ -21,6 +32,8 @@ private:
     bool AddPage(int page_id);
 
     std::optional<int> AcquireFrame();
+
+    BufferPoolStats stats_;
 
 public:
   BufferPoolManager(std::size_t num_frames, const fs::path& file_path)
@@ -41,4 +54,8 @@ public:
     bool FlushPage(int page_id);
 
     bool FlushAllPages();
+
+    BufferPoolStats GetStats() const;
+
+    void ResetStats();
 };

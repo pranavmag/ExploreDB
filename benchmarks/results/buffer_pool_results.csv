@@ -1,0 +1,5 @@
+policy,workload,buffer_size,num_pages,num_accesses,hits,misses,evictions,disk_reads,disk_writes,dirty_evictions,hit_rate,elapsed_us
+clock,sequential,2,4,1000,0,1000,998,1000,0,0,0,2306
+clock,sequential,4,4,1000,996,4,0,4,0,0,0.996,199
+clock,sequential,8,4,1000,996,4,0,4,0,0,0.996,204
+clock,sequential,16,4,1000,996,4,0,4,0,0,0.996,201

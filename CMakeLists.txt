@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.14)
 
-project(BufferPool)
+project(ExploreDB)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -32,11 +32,11 @@ target_include_directories(db_core
 # Main executable
 # ---------------------------
 
-add_executable(buffer_pool
+add_executable(exploredb
     main.cpp
 )
 
-target_link_libraries(buffer_pool
+target_link_libraries(exploredb
     PRIVATE
     db_core
 )
@@ -72,6 +72,19 @@ target_link_libraries(db_tests
 
 include(GoogleTest)
 gtest_discover_tests(db_tests)
+
+# ---------------------------
+# Benchmarks
+# ---------------------------
+
+add_executable(buffer_pool_benchmark
+    benchmarks/cpp/buffer_pool_benchmark.cpp
+)
+
+target_link_libraries(buffer_pool_benchmark
+    PRIVATE
+    db_core
+)
 
 # ---------------------------
 # ThreadSanitizer

@@ -29,6 +29,8 @@ bool BufferPoolManager::AddPage(int page_id) {
         auto guard = page.WriteLatch();
 
         disk_manager_.ReadPage(page_id, page);
+
+        ++stats_.disk_reads;
     }
 
     page_table_.AddMapping(page_id, *frame_id);
@@ -49,14 +51,20 @@ std::optional<int> BufferPoolManager::AcquireFrame() {
     std::optional<int> victim = clock_replacer_.FindVictim(frame_array_);
 
     if (victim) {
+        ++stats_.evictions;
+
         Frame& frame = *frame_array_[*victim];
 
         if (frame.IsDirty()) {
+            ++stats_.dirty_evictions;
+
             Page& page = frame.GetPage();
 
             auto guard = page.WriteLatch();
 
             disk_manager_.WritePage(page.GetPageId(), page);
+
+            ++stats_.disk_writes;
 
             frame.ClearDirty();
         }
@@ -104,9 +112,13 @@ Page* BufferPoolManager::NewPage(int& page_id) {
 Page* BufferPoolManager::FetchPage(int page_id) {
     std::lock_guard<std::mutex> guard(bpm_mutex_);
 
+    ++stats_.fetch_requests;
+
     auto frame_id = page_table_.GetMapping(page_id);
 
     if (!frame_id) {
+        ++stats_.misses;
+
         if (!AddPage(page_id)) {
             return nullptr;
         }
@@ -114,6 +126,9 @@ Page* BufferPoolManager::FetchPage(int page_id) {
         frame_id = page_table_.GetMapping(page_id);
 
         assert(frame_id.has_value());
+    }
+    else {
+        ++stats_.hits;
     }
 
     Frame &frame = *frame_array_[*frame_id];
@@ -160,6 +175,8 @@ bool BufferPoolManager::FlushPage(int page_id) {
 
         disk_manager_.WritePage(page_id, page);
 
+        ++stats_.disk_writes;
+
         frame.ClearDirty();
 
         return true;
@@ -184,8 +201,20 @@ bool BufferPoolManager::FlushAllPages() {
 
         disk_manager_.WritePage(page.GetPageId(), page);
 
+        ++stats_.disk_writes;
+
         frame.ClearDirty();
     }
 
     return true;
+}
+
+BufferPoolStats BufferPoolManager::GetStats() const {
+    std::lock_guard<std::mutex> guard(bpm_mutex_);
+    return stats_;
+}
+
+void BufferPoolManager::ResetStats() {
+    std::lock_guard<std::mutex> guard(bpm_mutex_);
+    stats_ = {};
 }
