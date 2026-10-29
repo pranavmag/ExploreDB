@@ -5,7 +5,77 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
 #include <vector>
+
+struct BenchmarkConfig {
+    std::size_t buffer_size = 4;
+    int num_pages = 16;
+    int num_accesses = 1000;
+    std::string workload = "sequential";
+    int run = 0;
+
+    std::filesystem::path output = "benchmarks/results/buffer_pool_results.csv";
+};
+
+BenchmarkConfig ParseArguments(int argc, char* argv[]) {
+    BenchmarkConfig config;
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view arg = argv[i];
+
+        if (arg == "--buffer-size") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("Missing value for --buffer-size");
+            }
+
+            config.buffer_size =
+                static_cast<std::size_t>(std::stoull(argv[++i]));
+        }
+        else if (arg == "--num-pages") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("Missing value for --num-pages");
+            }
+
+            config.num_pages = std::stoi(argv[++i]);
+        }
+        else if (arg == "--num-accesses") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("Missing value for --num-accesses");
+            }
+
+            config.num_accesses = std::stoi(argv[++i]);
+        }
+        else if (arg == "--workload") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("Missing value for --workload");
+            }
+
+            config.workload = argv[++i];
+        }
+        else if (arg == "--run") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("Missing value for --run");
+            }
+
+            config.run = std::stoi(argv[++i]);
+        }
+        else if (arg == "--output") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("Missing value for --output");
+            }
+
+            config.output = argv[++i];
+        }
+        else {
+            throw std::runtime_error("Unknown argument: " + std::string(arg));
+        }
+    }
+
+    return config;
+}
 
 std::vector<int> SetupPages(std::size_t buffer_size, int num_pages, const std::filesystem::path& db_path) {
     std::vector<int> page_ids;
@@ -93,8 +163,7 @@ void PrintResults(
         << "evictions: " << stats.evictions << '\n'
         << "disk_reads: " << stats.disk_reads << '\n'
         << "disk_writes: " << stats.disk_writes << '\n'
-        << "dirty_evictions: "
-        << stats.dirty_evictions << '\n'
+        << "dirty_evictions: " << stats.dirty_evictions << '\n'
         << "hit_rate: " << hit_rate << '\n'
         << "elapsed_us: " << elapsed_us << '\n';
 }
@@ -107,6 +176,7 @@ void WriteResultCSV(
     std::size_t buffer_size,
     int num_pages,
     int num_accesses,
+    int run,
     long long elapsed_us
 ) {
     const bool file_exists = std::filesystem::exists(csv_path);
@@ -123,7 +193,7 @@ void WriteResultCSV(
     if (!file_exists) {
         out
             << "policy,workload,buffer_size,num_pages,"
-               "num_accesses,hits,misses,evictions,"
+               "num_accesses,run,hits,misses,evictions,"
                "disk_reads,disk_writes,dirty_evictions,"
                "hit_rate,elapsed_us\n";
     }
@@ -140,6 +210,7 @@ void WriteResultCSV(
         << buffer_size << ','
         << num_pages << ','
         << num_accesses << ','
+        << run << ','
         << stats.hits << ','
         << stats.misses << ','
         << stats.evictions << ','
@@ -150,33 +221,68 @@ void WriteResultCSV(
         << elapsed_us << '\n';
 }
 
-int main() {
-    const std::filesystem::path csv_path = "benchmarks/results/buffer_pool_results.csv";
-    std::filesystem::remove(csv_path);
+int main(int argc, char* argv[]) {    
+    try {
+        const BenchmarkConfig config = ParseArguments(argc, argv);
 
-    for (std::size_t buffer_size : {2, 4, 8, 16}) {
-      constexpr int NUM_PAGES = 4;
-      constexpr int NUM_ACCESSES = 1000;
+        const std::filesystem::path db_path = "buffer_pool_benchmark.db";
 
-      const std::filesystem::path db_path = "buffer_pool_benchmark.db";
+        std::filesystem::remove(db_path);
 
-      std::filesystem::remove(db_path);
+        const auto page_ids =
+            SetupPages(
+                config.buffer_size,
+                config.num_pages,
+                db_path
+            );
 
-      const auto page_ids = SetupPages(buffer_size, NUM_PAGES, db_path);
+        BufferPoolManager bpm(
+            config.buffer_size,
+            db_path
+        );
 
-      BufferPoolManager bpm(buffer_size, db_path);
+        long long elapsed_us = 0;
 
-      long long elapsed_us = 0;
+        BufferPoolStats stats;
 
-      const BufferPoolStats stats =
-          RunSequentialWorkload(bpm, page_ids, NUM_ACCESSES, elapsed_us);
+        if (config.workload == "sequential") {
+            stats =
+                RunSequentialWorkload(
+                    bpm,
+                    page_ids,
+                    config.num_accesses,
+                    elapsed_us
+                );
+        }
+        else {
+            throw std::runtime_error(
+                "Unsupported workload: "
+                + config.workload
+            );
+        }
 
-    //   PrintResults(stats, buffer_size, NUM_PAGES, NUM_ACCESSES, elapsed_us);
-    //   std::cout << '\n';
+        WriteResultCSV(
+            config.output,
+            stats,
+            "clock",
+            config.workload,
+            config.buffer_size,
+            config.num_pages,
+            config.num_accesses,
+            config.run,
+            elapsed_us
+        );
 
-      WriteResultCSV(csv_path, stats, "clock", "sequential", buffer_size,
-        NUM_PAGES, NUM_ACCESSES, elapsed_us);
-
-      std::filesystem::remove(db_path);
+        std::filesystem::remove(db_path);
     }
+    catch (const std::exception& e) {
+        std::cerr
+            << "Benchmark error: "
+            << e.what()
+            << '\n';
+
+        return 1;
+    }
+
+    return 0;
 }
