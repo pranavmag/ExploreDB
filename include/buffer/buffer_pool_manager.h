@@ -29,7 +29,7 @@ private:
 
     mutable std::mutex bpm_mutex_;
 
-    bool AddPage(int page_id);
+    bool LoadPageIntoFrame(int page_id);
 
     std::optional<int> AcquireFrame();
 

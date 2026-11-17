@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -16,6 +17,10 @@ struct BenchmarkConfig {
     int num_accesses = 1000;
     std::string workload = "sequential";
     int run = 0;
+
+    double hot_fraction = 0.20;
+    double hot_probability = 0.80;
+    std::uint32_t seed = 42;
 
     std::filesystem::path output = "benchmarks/results/buffer_pool_results.csv";
 };
@@ -68,9 +73,26 @@ BenchmarkConfig ParseArguments(int argc, char* argv[]) {
             }
 
             config.output = argv[++i];
-        }
-        else {
-            throw std::runtime_error("Unknown argument: " + std::string(arg));
+        } else if (arg == "--hot-fraction") {
+          if (i + 1 >= argc) {
+            throw std::runtime_error("Missing value for --hot-fraction");
+          }
+
+          config.hot_fraction = std::stod(argv[++i]);
+        } else if (arg == "--hot-probability") {
+          if (i + 1 >= argc) {
+            throw std::runtime_error("Missing value for --hot-probability");
+          }
+
+          config.hot_probability = std::stod(argv[++i]);
+        } else if (arg == "--seed") {
+          if (i + 1 >= argc) {
+            throw std::runtime_error("Missing value for --seed");
+          }
+
+          config.seed = static_cast<std::uint32_t>(std::stoul(argv[++i]));
+        } else {
+          throw std::runtime_error("Unknown argument: " + std::string(arg));
         }
     }
 
@@ -137,6 +159,67 @@ BufferPoolStats RunSequentialWorkload(
 
     elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
 
+    return bpm.GetStats();
+}
+
+BufferPoolStats RunHotColdWorkload(
+    BufferPoolManager& bpm,
+    const std::vector<int>& page_ids,
+    int num_accesses,
+    double hot_fraction,
+    double hot_probability,
+    std::uint32_t seed,
+    long long& elapsed_us
+) {
+    if (page_ids.empty()) {
+        throw std::runtime_error("Hot/cold workload requires at least one page");
+    }
+
+    const std::size_t hot_count = 
+        std::max<std::size_t>(1, static_cast<std::size_t>(page_ids.size() * hot_fraction));
+
+    if (hot_count >- page_ids.size()) {
+        throw std::runtime_error("Hot set must be smaller than total working set");
+    }
+    
+    std::mt19937 rng(seed);
+
+    std::bernoulli_distribution choose_hot(hot_probability);
+
+    std::uniform_int_distribution<std::size_t> hot_dist(0, hot_count - 1);
+
+    std::uniform_int_distribution<std::size_t> cold_dist(hot_count, page_ids.size() -1);
+
+    bpm.ResetStats();
+
+    const auto start = std::chrono::steady_clock::now();
+
+    for (int i{}; i < num_accesses; ++i) {
+        std::size_t index;
+
+        if (choose_hot(rng)) {
+            index = hot_dist(rng);
+        }
+        else {
+            index = cold_dist(rng);
+        }
+
+        const int page_id = page_ids[index];
+
+        Page* page = bpm.FetchPage(page_id);
+
+        if (page == nullptr) {
+            throw std::runtime_error("Failed to fetch page during hot/cold workload");
+        }
+
+        bpm.UnpinPage(page_id, false);
+    }
+
+    const auto end = std::chrono::steady_clock::now();
+
+    elapsed_us = std::chrono::duration_cast<std::chrono::microseconds
+        >(end - start).count();
+    
     return bpm.GetStats();
 }
 
@@ -246,19 +329,26 @@ int main(int argc, char* argv[]) {
         BufferPoolStats stats;
 
         if (config.workload == "sequential") {
-            stats =
-                RunSequentialWorkload(
+            stats = RunSequentialWorkload(
                     bpm,
                     page_ids,
                     config.num_accesses,
                     elapsed_us
                 );
         }
-        else {
-            throw std::runtime_error(
-                "Unsupported workload: "
-                + config.workload
+        else if (config.workload == "hot-cold") {
+            stats = RunHotColdWorkload(
+                    bpm,
+                    page_ids,
+                    config.num_accesses,
+                    config.hot_fraction,
+                    config.hot_probability,
+                    config.seed,
+                    elapsed_us
             );
+        }
+        else {
+            throw std::runtime_error("Unsupported workload: " + config.workload);
         }
 
         WriteResultCSV(

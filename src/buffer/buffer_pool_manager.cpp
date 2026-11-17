@@ -4,7 +4,7 @@
 #include <optional>
 
 // Caller must hold bpm_mutex_.
-bool BufferPoolManager::AddPage(int page_id) {
+bool BufferPoolManager::LoadPageIntoFrame(int page_id) {
     if (page_table_.GetMapping(page_id)) {
         return true;
     }
@@ -119,7 +119,7 @@ Page* BufferPoolManager::FetchPage(int page_id) {
     if (!frame_id) {
         ++stats_.misses;
 
-        if (!AddPage(page_id)) {
+        if (!LoadPageIntoFrame(page_id)) {
             return nullptr;
         }
 

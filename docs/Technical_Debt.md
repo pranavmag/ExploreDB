@@ -46,10 +46,14 @@ For compaction it uses `std::vector<LiveSlot> live_slots;` which means a page-le
 
 `std::uint16_t` is used for offset, length, free_start, and free_end which is good for 4096-byte pages but it means that the physical layout cannot represent offsets beyond 65535.
 
-### Directory chaining is designed but not fully implemented for PageDirectory
-
-The physical format supports next_dir_page and HeapFile can traverse chains. But when the final directory reaches DIRECTORY_ENTRY_CAPACITY, it currently returns failure rather than allocate and link another directory page.
-
 ### Directory search is currently linear
 
 Finding a particular data page for UpdateDirectoryFreeSpace() requires scanning directory page, scanning entries, and possibly following next directory. So lookup is currently linear in the number of HeapFile pages. At the current scale it is fine but later it can turn into experimenting with linear directory, free-space buckets, page-id map, and free-space map/tree.
+
+### Buffer Pool Manager Technical Debt
+
+Buffer frame reassignment is not strongly exception-safe. An I/O or allocation exception during a multi-step frame transition may leave partially updated internal state. Same thing in NewPage() after calling AcquireFrame() there is a failure window before the new page is installed into the frame.
+
+Raw Page* instead of RAII page guards is not ideal. Page* FetchPage() and Page* NewPage() combined with manual UnpinPage() means that correctness depends on the callers pairing operations correctly.
+
+All BPM metadata operations are serialized behind the bpm mutex which means that two unrelated cache hits both pass through the same mutex which limits scalability.

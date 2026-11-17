@@ -1,9 +1,11 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 
-df = pd.read_csv(
-    "benchmarks/results/buffer_pool_results.csv"
-)
+WORKLOAD = "hot-cold"
+
+RESULTS_FILE = (f"benchmarks/results/{WORKLOAD}_buffer_pool_results.csv")
+
+df = pd.read_csv(RESULTS_FILE)
 
 summary = (
     df.groupby([
@@ -17,6 +19,12 @@ summary = (
     )
     .reset_index()
 )
+
+workload_title = {
+    "sequential": "Sequential",
+    "hot-cold": "Hot/Cold",
+    "random": "Uniform Random",
+}[WORKLOAD]
 
 print(summary)
 
@@ -89,6 +97,15 @@ for row in range(len(hit_rate_matrix.index)):
 
 plt.xlabel("Working Set Size (pages)")
 plt.ylabel("Buffer Size (frames)")
-plt.title("CLOCK — Sequential Workload Hit Rate")
+
+if WORKLOAD == "hot-cold":
+    plt.title(
+        "CLOCK — Hot/Cold Workload Hit Rate\n"
+        "20% Hot Pages / 80% Hot Access Probability"
+    )
+else:
+    plt.title(
+        f"CLOCK — {workload_title} Workload Hit Rate"
+    )
 
 plt.show()

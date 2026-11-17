@@ -3,7 +3,9 @@ from pathlib import Path
 
 BENCHMARK_EXE = Path("./build/buffer_pool_benchmark")
 
-RESULTS_FILE = Path("benchmarks/results/buffer_pool_results.csv")
+WORKLOAD = "hot-cold"
+
+RESULTS_FILE = Path(f"benchmarks/results/{WORKLOAD}_buffer_pool_results.csv")
 
 BUFFER_SIZES = [2, 4, 8, 16, 32]
 NUM_PAGES_VALUES = [4, 8, 16, 32, 64]
@@ -11,7 +13,10 @@ NUM_PAGES_VALUES = [4, 8, 16, 32, 64]
 NUM_ACCESSES = 10_000
 REPETITIONS = 10
 
-WORKLOAD = "sequential"
+# Hot/cold specific settings
+HOT_FRACTION = 0.20
+HOT_PROBABILITY = 0.80
+SEED = 42
 
 
 def run_benchmark(
@@ -36,6 +41,16 @@ def run_benchmark(
         "--output",
         str(RESULTS_FILE),
     ]
+
+    if workload == "hot-cold":
+        command.extend([
+            "--hot-fraction",
+            str(HOT_FRACTION),
+            "--hot-probability",
+            str(HOT_PROBABILITY),
+            "--seed",
+            str(SEED),
+        ])
 
     subprocess.run(command, check=True,)
 
